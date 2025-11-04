@@ -10,12 +10,30 @@ import {PoolId} from "v4-core/types/PoolId.sol";
 import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
 import {SwapParams, ModifyLiquidityParams} from "v4-core/types/PoolOperation.sol";
 
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 
 import {Hooks} from "v4-core/libraries/Hooks.sol";
 
-contract PointsHook is BaseHook, ERC1155 {
-    constructor(IPoolManager _manager) BaseHook(_manager) {}
+contract PointsHook is BaseHook, ERC1155, Ownable {
+    event MinimalSwapWeiAmount(uint256 weiAmount);
+    uint256 public minSwapWei;
+
+    error PointsHook__ZeroWeiAmount();
+
+    constructor(IPoolManager _manager, uint256 _minSwapWei) BaseHook(_manager) Ownable(msg.sender) {
+        minSwapWei = _minSwapWei;
+    }
+
+    function setMinSwapWei(uint256 weiAmount) external onlyOwner {
+        if (weiAmount == 0) {
+            revert PointsHook__ZeroWeiAmount();
+        }
+
+        minSwapWei = weiAmount;
+
+        emit MinimalSwapWeiAmount(weiAmount);
+    }
 
     function getHookPermissions()
         public
@@ -69,6 +87,12 @@ contract PointsHook is BaseHook, ERC1155 {
         //      amount of ETH they spent is equal to BalanceDelta.amount0()
 
         uint256 ethSpendAmount = uint256(int256(-delta.amount0()));
+
+        // anti-dust functionality
+        if (ethSpendAmount < minSwapWei) {
+            return (this.afterSwap.selector, 0);
+        }
+
         uint256 pointsForSwap = ethSpendAmount / 5;
 
         // Mint the points

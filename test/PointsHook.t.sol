@@ -47,7 +47,8 @@ contract TestPointsHook is Test, Deployers, ERC1155TokenReceiver {
 
         // Deploy hook to an address that has the proper flags set
         uint160 flags = uint160(Hooks.AFTER_SWAP_FLAG);
-        deployCodeTo("PointsHook.sol", abi.encode(manager), address(flags));
+        uint256 minSwapWei = 0.0001 ether; // Set minimum swap amount
+        deployCodeTo("PointsHook.sol", abi.encode(manager, minSwapWei), address(flags));
 
         // Deploy our hook
         hook = PointsHook(address(flags));
@@ -62,7 +63,7 @@ contract TestPointsHook is Test, Deployers, ERC1155TokenReceiver {
             ethCurrency, // Currency 0 = ETH
             tokenCurrency, // Currency 1 = TOKEN
             hook, // Hook Contract
-            3000, // Swap Fees
+            3000, // Swap Fees 0.3%
             SQRT_PRICE_1_1 // Initial Sqrt(P) value = 1
         );
 
@@ -126,5 +127,152 @@ contract TestPointsHook is Test, Deployers, ERC1155TokenReceiver {
             poolIdUint
         );
         assertEq(pointsBalanceAfterSwap - pointsBalanceOriginal, 2 * 10 ** 14);
+    }
+
+    // ===== ANTI-DUST TESTS =====
+
+    /// @notice Test that swaps below minimum don't mint points
+    function test_antiDust_BelowMinimum_NoPoints() public {
+        uint256 poolIdUint = uint256(PoolId.unwrap(key.toId()));
+        bytes memory hookData = abi.encode(address(this));
+
+        // Get initial balance
+        uint256 pointsBefore = hook.balanceOf(address(this), poolIdUint);
+
+        // Swap BELOW the minimum (0.0001 ether)
+        // We're swapping 0.00005 ether which is less than minSwapWei
+        swapRouter.swap{value: 0.00005 ether}(
+            key,
+            SwapParams({
+                zeroForOne: true,
+                amountSpecified: -0.00005 ether,
+                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({
+                takeClaims: false,
+                settleUsingBurn: false
+            }),
+            hookData
+        );
+
+        // Points should NOT increase
+        uint256 pointsAfter = hook.balanceOf(address(this), poolIdUint);
+        assertEq(pointsAfter, pointsBefore, "Dust swap should not mint points");
+    }
+
+    /// @notice Test that swaps exactly at minimum DO mint points
+    function test_antiDust_ExactlyAtMinimum_MintsPoints() public {
+        uint256 poolIdUint = uint256(PoolId.unwrap(key.toId()));
+        bytes memory hookData = abi.encode(address(this));
+
+        uint256 pointsBefore = hook.balanceOf(address(this), poolIdUint);
+
+        // Swap EXACTLY at the minimum (0.0001 ether)
+        swapRouter.swap{value: 0.0001 ether}(
+            key,
+            SwapParams({
+                zeroForOne: true,
+                amountSpecified: -0.0001 ether,
+                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({
+                takeClaims: false,
+                settleUsingBurn: false
+            }),
+            hookData
+        );
+
+        // Points SHOULD increase: 20% of 0.0001 ether = 0.00002 ether = 2e13
+        uint256 pointsAfter = hook.balanceOf(address(this), poolIdUint);
+        uint256 expectedPoints = 0.0001 ether / 5;
+        assertEq(pointsAfter - pointsBefore, expectedPoints, "Should mint points for minimum swap");
+    }
+
+    /// @notice Test that swaps above minimum mint correct points
+    function test_antiDust_AboveMinimum_MintsCorrectPoints() public {
+        uint256 poolIdUint = uint256(PoolId.unwrap(key.toId()));
+        bytes memory hookData = abi.encode(address(this));
+
+        uint256 pointsBefore = hook.balanceOf(address(this), poolIdUint);
+
+        // Swap well above minimum
+        uint256 swapAmount = 0.01 ether;
+        swapRouter.swap{value: swapAmount}(
+            key,
+            SwapParams({
+                zeroForOne: true,
+                amountSpecified: -int256(swapAmount),
+                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({
+                takeClaims: false,
+                settleUsingBurn: false
+            }),
+            hookData
+        );
+
+        uint256 pointsAfter = hook.balanceOf(address(this), poolIdUint);
+        uint256 expectedPoints = swapAmount / 5; // 20% = divide by 5
+        assertEq(pointsAfter - pointsBefore, expectedPoints, "Should mint 20% of swap amount");
+    }
+
+    /// @notice Test that owner can update minSwapWei
+    function test_antiDust_OwnerCanUpdateMinimum() public {
+        // Initial value set in setUp: 0.0001 ether
+        assertEq(hook.minSwapWei(), 0.0001 ether);
+
+        // Update to new value
+        uint256 newMin = 0.001 ether;
+        hook.setMinSwapWei(newMin);
+
+        assertEq(hook.minSwapWei(), newMin, "Minimum should be updated");
+    }
+
+    /// @notice Test that non-owner cannot update minSwapWei
+    function test_antiDust_NonOwnerCannotUpdate() public {
+        // Prank as address(1) who is not the owner
+        vm.prank(address(1));
+
+        // This should revert with Ownable error
+        vm.expectRevert();
+        hook.setMinSwapWei(0.002 ether);
+    }
+
+    /// @notice Test that setting minSwapWei to 0 reverts
+    function test_antiDust_CannotSetToZero() public {
+        // Try to set to 0, should revert
+        vm.expectRevert(PointsHook.PointsHook__ZeroWeiAmount.selector);
+        hook.setMinSwapWei(0);
+    }
+
+    /// @notice Test multiple small swaps don't accumulate points
+    function test_antiDust_MultipleSmallSwaps_NoAccumulation() public {
+        uint256 poolIdUint = uint256(PoolId.unwrap(key.toId()));
+        bytes memory hookData = abi.encode(address(this));
+
+        uint256 pointsBefore = hook.balanceOf(address(this), poolIdUint);
+
+        // Do 10 dust swaps
+        for (uint i = 0; i < 10; i++) {
+            swapRouter.swap{value: 0.00001 ether}(
+                key,
+                SwapParams({
+                    zeroForOne: true,
+                    amountSpecified: -0.00001 ether,
+                    sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+                }),
+                PoolSwapTest.TestSettings({
+                    takeClaims: false,
+                    settleUsingBurn: false
+                }),
+                hookData
+            );
+        }
+
+        uint256 pointsAfter = hook.balanceOf(address(this), poolIdUint);
+
+        // Even though total = 0.0001 ether (at minimum),
+        // individual swaps were below minimum so NO points minted
+        assertEq(pointsAfter, pointsBefore, "Dust swaps should never accumulate points");
     }
 }
