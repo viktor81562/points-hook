@@ -48,7 +48,8 @@ contract TestPointsHook is Test, Deployers, ERC1155TokenReceiver {
         // Deploy hook to an address that has the proper flags set
         uint160 flags = uint160(Hooks.AFTER_SWAP_FLAG);
         uint256 minSwapWei = 0.0001 ether; // Set minimum swap amount
-        deployCodeTo("PointsHook.sol", abi.encode(manager, minSwapWei), address(flags));
+        uint256 dailyCapPerUser = 1 ether; // Set daily cap to 1 ether worth of points
+        deployCodeTo("PointsHook.sol", abi.encode(manager, minSwapWei, dailyCapPerUser), address(flags));
 
         // Deploy our hook
         hook = PointsHook(address(flags));
@@ -68,10 +69,11 @@ contract TestPointsHook is Test, Deployers, ERC1155TokenReceiver {
         );
 
         // Add some liquidity to the pool
-        uint160 sqrtPriceAtTickLower = TickMath.getSqrtPriceAtTick(-60);
-        uint160 sqrtPriceAtTickUpper = TickMath.getSqrtPriceAtTick(60);
+        // Use wider range and more liquidity to support large swaps
+        uint160 sqrtPriceAtTickLower = TickMath.getSqrtPriceAtTick(-600);
+        uint160 sqrtPriceAtTickUpper = TickMath.getSqrtPriceAtTick(600);
 
-        uint256 ethToAdd = 0.1 ether;
+        uint256 ethToAdd = 100 ether; // Increase liquidity to support 10 ETH swaps
         uint128 liquidityDelta = LiquidityAmounts.getLiquidityForAmount0(
             SQRT_PRICE_1_1,
             sqrtPriceAtTickUpper,
@@ -86,8 +88,8 @@ contract TestPointsHook is Test, Deployers, ERC1155TokenReceiver {
         modifyLiquidityRouter.modifyLiquidity{value: ethToAdd}(
             key,
             ModifyLiquidityParams({
-                tickLower: -60,
-                tickUpper: 60,
+                tickLower: -600,
+                tickUpper: 600,
                 liquidityDelta: int256(uint256(liquidityDelta)),
                 salt: bytes32(0)
             }),
@@ -274,5 +276,226 @@ contract TestPointsHook is Test, Deployers, ERC1155TokenReceiver {
         // Even though total = 0.0001 ether (at minimum),
         // individual swaps were below minimum so NO points minted
         assertEq(pointsAfter, pointsBefore, "Dust swaps should never accumulate points");
+    }
+
+    // ===== DAILY CAP TESTS =====
+
+    /// @notice Test that daily cap is enforced
+    function test_dailyCap_EnforcedCorrectly() public {
+        uint256 poolIdUint = uint256(PoolId.unwrap(key.toId()));
+        bytes memory hookData = abi.encode(address(this));
+
+        // Daily cap is 1 ether worth of points
+        // Do a large swap that would normally give more than 1 ether in points
+        // Swapping 10 ether would normally give 2 ether in points (20%)
+        // But should be capped at 1 ether
+        uint256 pointsBefore = hook.balanceOf(address(this), poolIdUint);
+
+        swapRouter.swap{value: 10 ether}(
+            key,
+            SwapParams({
+                zeroForOne: true,
+                amountSpecified: -10 ether,
+                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({
+                takeClaims: false,
+                settleUsingBurn: false
+            }),
+            hookData
+        );
+
+        uint256 pointsAfter = hook.balanceOf(address(this), poolIdUint);
+
+        // Should only receive 1 ether (the cap), not 2 ether
+        assertEq(pointsAfter - pointsBefore, 1 ether, "Points should be capped at daily limit");
+    }
+
+    /// @notice Test that no points are minted once daily cap is reached
+    function test_dailyCap_NoPointsAfterCapReached() public {
+        uint256 poolIdUint = uint256(PoolId.unwrap(key.toId()));
+        bytes memory hookData = abi.encode(address(this));
+
+        // First swap: reach the daily cap
+        swapRouter.swap{value: 10 ether}(
+            key,
+            SwapParams({
+                zeroForOne: true,
+                amountSpecified: -10 ether,
+                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({
+                takeClaims: false,
+                settleUsingBurn: false
+            }),
+            hookData
+        );
+
+        uint256 pointsAfterFirst = hook.balanceOf(address(this), poolIdUint);
+
+        // Second swap: should get 0 points as cap already reached
+        swapRouter.swap{value: 1 ether}(
+            key,
+            SwapParams({
+                zeroForOne: true,
+                amountSpecified: -1 ether,
+                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({
+                takeClaims: false,
+                settleUsingBurn: false
+            }),
+            hookData
+        );
+
+        uint256 pointsAfterSecond = hook.balanceOf(address(this), poolIdUint);
+
+        assertEq(pointsAfterSecond, pointsAfterFirst, "No points should be minted after cap reached");
+    }
+
+    /// @notice Test that daily cap resets on new day
+    function test_dailyCap_ResetsOnNewDay() public {
+        uint256 poolIdUint = uint256(PoolId.unwrap(key.toId()));
+        bytes memory hookData = abi.encode(address(this));
+
+        // Day 1: Reach cap
+        swapRouter.swap{value: 10 ether}(
+            key,
+            SwapParams({
+                zeroForOne: true,
+                amountSpecified: -10 ether,
+                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({
+                takeClaims: false,
+                settleUsingBurn: false
+            }),
+            hookData
+        );
+
+        uint256 pointsDay1 = hook.balanceOf(address(this), poolIdUint);
+
+        // Fast forward to next day (86400 seconds = 1 day)
+        vm.warp(block.timestamp + 1 days);
+
+        // Day 2: Should be able to earn points again
+        swapRouter.swap{value: 1 ether}(
+            key,
+            SwapParams({
+                zeroForOne: true,
+                amountSpecified: -1 ether,
+                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({
+                takeClaims: false,
+                settleUsingBurn: false
+            }),
+            hookData
+        );
+
+        uint256 pointsDay2 = hook.balanceOf(address(this), poolIdUint);
+
+        // Should have earned 0.2 ether more points (20% of 1 ether)
+        assertEq(pointsDay2 - pointsDay1, 0.2 ether, "Should earn points again on new day");
+    }
+
+    /// @notice Test that owner can update daily cap
+    function test_dailyCap_OwnerCanUpdate() public {
+        assertEq(hook.dailyCapPerUser(), 1 ether);
+
+        uint256 newCap = 5 ether;
+        hook.setDailyCapPerUser(newCap);
+
+        assertEq(hook.dailyCapPerUser(), newCap, "Daily cap should be updated");
+    }
+
+    /// @notice Test that non-owner cannot update daily cap
+    function test_dailyCap_NonOwnerCannotUpdate() public {
+        vm.prank(address(1));
+
+        vm.expectRevert();
+        hook.setDailyCapPerUser(5 ether);
+    }
+
+    /// @notice Test that daily cap cannot be set to zero
+    function test_dailyCap_CannotSetToZero() public {
+        vm.expectRevert(PointsHook.PointsHook__ZeroDailyCap.selector);
+        hook.setDailyCapPerUser(0);
+    }
+
+    /// @notice Test getRemainingDailyAllowance function
+    function test_dailyCap_RemainingAllowance() public {
+        address user = address(this);
+
+        // Initially should have full allowance
+        assertEq(hook.getRemainingDailyAllowance(user), 1 ether);
+
+        bytes memory hookData = abi.encode(user);
+
+        // Swap to earn some points (0.2 ether worth)
+        swapRouter.swap{value: 1 ether}(
+            key,
+            SwapParams({
+                zeroForOne: true,
+                amountSpecified: -1 ether,
+                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({
+                takeClaims: false,
+                settleUsingBurn: false
+            }),
+            hookData
+        );
+
+        // Remaining should be 0.8 ether
+        assertEq(hook.getRemainingDailyAllowance(user), 0.8 ether);
+
+        // Reach the cap
+        swapRouter.swap{value: 10 ether}(
+            key,
+            SwapParams({
+                zeroForOne: true,
+                amountSpecified: -10 ether,
+                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({
+                takeClaims: false,
+                settleUsingBurn: false
+            }),
+            hookData
+        );
+
+        // Remaining should be 0
+        assertEq(hook.getRemainingDailyAllowance(user), 0);
+    }
+
+    /// @notice Test that different users have independent daily caps
+    function test_dailyCap_IndependentPerUser() public {
+        uint256 poolIdUint = uint256(PoolId.unwrap(key.toId()));
+
+        address user1 = address(this);
+        address user2 = address(1);
+
+        // User1 reaches cap
+        bytes memory hookData1 = abi.encode(user1);
+        swapRouter.swap{value: 10 ether}(
+            key,
+            SwapParams({
+                zeroForOne: true,
+                amountSpecified: -10 ether,
+                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({
+                takeClaims: false,
+                settleUsingBurn: false
+            }),
+            hookData1
+        );
+
+        // User1 should have full cap
+        assertEq(hook.getRemainingDailyAllowance(user1), 0);
+
+        // User2 should still have full allowance
+        assertEq(hook.getRemainingDailyAllowance(user2), 1 ether);
     }
 }
